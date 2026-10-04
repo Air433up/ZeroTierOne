@@ -1,0 +1,83 @@
+name: Build ZeroTier Linux x86_64
+
+on:
+  # 手动触发，可选指定版本
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的 tag 或 branch（留空则用当前仓库默认分支）'
+        required: false
+        default: ''
+  # 也可以 push tag 时自动触发
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm \
+            pkg-config \
+            libssl-dev \
+            libminiupnpc-dev \
+            libnatpmp-dev \
+            curl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build ZeroTier
+        run: |
+          # 构建系统会自动检测 clang 并启用 x86_64 优化 (SSE/SSE2)
+          make -j$(nproc) ZT_SSO_SUPPORTED=1
+
+      - name: Verify binaries
+        run: |
+          echo "=== 文件信息 ==="
+          file zerotier-one
+          ls -lh zerotier-one zerotier-cli zerotier-idtool 2>/dev/null || true
+          echo "=== 版本 ==="
+          ./zerotier-one --version || true
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          # 复制主程序和工具
+          cp zerotier-one artifacts/
+          # zerotier-cli 通常是符号链接，复制实际文件
+          cp -L zerotier-cli artifacts/ 2>/dev/null || true
+          cp -L zerotier-idtool artifacts/ 2>/dev/null || true
+          # 记录版本信息
+          echo "ZeroTier $(./zerotier-one --version 2>/dev/null || echo 'unknown')" > artifacts/VERSION.txt
+          echo "Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> artifacts/VERSION.txt
+          echo "Commit: ${{ github.sha }}" >> artifacts/VERSION.txt
+          echo "Runner: $(uname -a)" >> artifacts/VERSION.txt
+          # 打包
+          cd artifacts && tar czf ../zerotier-linux-x64.tar.gz *
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerotier-linux-x64
+          path: zerotier-linux-x64.tar.gz
+          retention-days: 30
+
+      - name: Create/Update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zerotier-linux-x64.tar.gz
+          generate_release_notes: true
