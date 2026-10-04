@@ -1,14 +1,22 @@
 name: Build ZeroTier Linux x86_64
 
 on:
-  # 手动触发，可选指定版本
+  # 手动触发，可选指定版本和是否启用SSO
   workflow_dispatch:
     inputs:
       ref:
         description: '要构建的 tag 或 branch（留空则用当前仓库默认分支）'
         required: false
         default: ''
-  # 也可以 push tag 时自动触发
+      enable_sso:
+        description: '是否启用 SSO/Rust 组件（关闭可大幅加快构建）'
+        required: false
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+  # push tag 时自动触发
   push:
     tags:
       - '*'
@@ -32,40 +40,55 @@ jobs:
             llvm \
             pkg-config \
             libssl-dev \
-            libminiupnpc-dev \
-            libnatpmp-dev \
             curl
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (if SSO enabled)
+        if: ${{ github.event.inputs.enable_sso == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) }}
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build ZeroTier
         run: |
-          # 构建系统会自动检测 clang 并启用 x86_64 优化 (SSE/SSE2)
-          make -j$(nproc) ZT_SSO_SUPPORTED=1
+          # ZT_USE_SYSTEM_MINIUPNPC=0 → 使用内置源码静态链接 miniupnpc/natpmp
+          #   生成的二进制不依赖系统 libminiupnpc.so，部署时零额外依赖
+          # ZT_SSO_SUPPORTED 由 workflow_dispatch 输入决定，tag 触发默认启用
+          SSO_FLAG="ZT_SSO_SUPPORTED=0"
+          if [ "${{ github.event.inputs.enable_sso }}" = "true" ] || \
+             ([ "${{ github.event_name }}" = "push" ] && echo "${{ github.ref }}" | grep -q '^refs/tags/'); then
+            SSO_FLAG="ZT_SSO_SUPPORTED=1"
+          fi
+          echo "Building with: ZT_USE_SYSTEM_MINIUPNPC=0 $SSO_FLAG"
+          make -j$(nproc) ZT_USE_SYSTEM_MINIUPNPC=0 $SSO_FLAG
 
       - name: Verify binaries
         run: |
           echo "=== 文件信息 ==="
           file zerotier-one
           ls -lh zerotier-one zerotier-cli zerotier-idtool 2>/dev/null || true
+          echo ""
+          echo "=== 动态库依赖（应无 miniupnpc/natpmp） ==="
+          ldd zerotier-one || true
+          echo ""
+          echo "=== 缺失的共享库 ==="
+          ldd zerotier-one | grep "not found" || echo "无缺失依赖 ✓"
+          echo ""
           echo "=== 版本 ==="
           ./zerotier-one --version || true
 
       - name: Package artifacts
         run: |
           mkdir -p artifacts
-          # 复制主程序和工具
           cp zerotier-one artifacts/
-          # zerotier-cli 通常是符号链接，复制实际文件
           cp -L zerotier-cli artifacts/ 2>/dev/null || true
           cp -L zerotier-idtool artifacts/ 2>/dev/null || true
-          # 记录版本信息
-          echo "ZeroTier $(./zerotier-one --version 2>/dev/null || echo 'unknown')" > artifacts/VERSION.txt
-          echo "Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> artifacts/VERSION.txt
-          echo "Commit: ${{ github.sha }}" >> artifacts/VERSION.txt
-          echo "Runner: $(uname -a)" >> artifacts/VERSION.txt
-          # 打包
+          # 记录构建信息
+          {
+            echo "ZeroTier $(./zerotier-one --version 2>/dev/null || echo 'unknown')"
+            echo "Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Commit: ${{ github.sha }}"
+            echo "Static linked: miniupnpc, natpmp"
+            echo "SSO: ${{ github.event.inputs.enable_sso || 'false' }}"
+            echo "Runner: $(uname -a)"
+          } > artifacts/VERSION.txt
           cd artifacts && tar czf ../zerotier-linux-x64.tar.gz *
 
       - name: Upload build artifact
